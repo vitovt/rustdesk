@@ -1,0 +1,816 @@
+# Derived from RustDesk 1.5.3 upstream build recipes.
+name: Build APRT Windows and Linux x64
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+env:
+  SCITER_RUST_VERSION: '1.75'
+  RUST_VERSION: '1.75'
+  MAC_RUST_VERSION: '1.81'
+  CARGO_NDK_VERSION: 3.1.2
+  SCITER_ARMV7_CMAKE_VERSION: 3.29.7
+  SCITER_NASM_DEBVERSION: 2.15.05-1
+  LLVM_VERSION: 15.0.6
+  FLUTTER_VERSION: 3.24.5
+  ANDROID_FLUTTER_VERSION: 3.24.5
+  FLUTTER_WINDOWS_ARM_VERSION: 3.44.9
+  FLUTTER_MACOS_ARM_VERSION: 3.44.9
+  FLUTTER_ELINUX_VERSION: 3.16.9
+  TAG_NAME: aprt-1.5.3
+  VCPKG_BINARY_SOURCES: clear;x-gha,readwrite
+  VCPKG_COMMIT_ID: 9e593bb18ea69cc5095e012465dcd675a822ed0d
+  VCPKG_CMAKE_VERSION: 4.3.0
+  ARMV7_VCPKG_COMMIT_ID: 6f29f12e82a8293156836ad81cc9bf5af41fe836
+  VERSION: 1.5.3
+  NDK_VERSION: r28c
+  ANDROID_SIGNING_KEY: ''
+  MACOS_P12_BASE64: ''
+  UPLOAD_ARTIFACT: 'true'
+  PUBLISH_UPDATE_METADATA: 'false'
+  SIGN_BASE_URL: '-2'
+jobs:
+  generate-bridge:
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+        - target: x86_64-unknown-linux-gnu
+          os: ubuntu-22.04
+          extra-build-args: ''
+          flutter-version: 3.22.3
+          artifact-name: bridge-artifact
+    steps:
+    - name: Checkout source code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        submodules: recursive
+        repository: rustdesk/rustdesk
+        ref: 95cca3f661f635b3cc85c04935fe8d96d8f432ef
+        persist-credentials: false
+    - name: Embed APRT server defaults
+      shell: bash
+      run: |
+        python3 - <<'APRT_PY'
+        #!/usr/bin/env python3
+        """Set APRT's default server and verification key in a RustDesk source checkout."""
+
+        import argparse
+        import base64
+        from pathlib import Path
+        import re
+
+        SERVER = "rustdesk.aprt.info"
+        PUBLIC_KEY = "Hag3BO1Z4qjSWIstKuNueXedZPL9CKJ4FWbxFC4nfRQ="
+
+
+        def main():
+            parser = argparse.ArgumentParser(description=__doc__)
+            parser.add_argument("source", type=Path, help="RustDesk checkout with initialized submodules")
+            args = parser.parse_args(["."])
+            if len(base64.b64decode(PUBLIC_KEY, validate=True)) != 32:
+                raise SystemExit("Expected a 32-byte server public key")
+            path = args.source / "libs/hbb_common/src/config.rs"
+            if not path.is_file():
+                raise SystemExit(f"Missing {path}; run git submodule update --init --recursive first")
+            original = path.read_text(encoding="utf-8")
+            updated = original
+            replacements = {
+                "RENDEZVOUS_SERVERS": (
+                    r'pub const RENDEZVOUS_SERVERS:\s*&\[&str\]\s*=\s*&\[[\s\S]*?\];',
+                    f'pub const RENDEZVOUS_SERVERS: &[&str] = &["{SERVER}"];',
+                ),
+                "RS_PUB_KEY": (
+                    r'pub const RS_PUB_KEY:\s*&str\s*=\s*"[^"\n]*";',
+                    f'pub const RS_PUB_KEY: &str = "{PUBLIC_KEY}";',
+                ),
+            }
+            for name, (pattern, replacement) in replacements.items():
+                updated, count = re.subn(pattern, lambda _: replacement, updated)
+                if count != 1:
+                    raise SystemExit(f"Expected exactly one {name} declaration; found {count}. No file written.")
+            if updated != original:
+                path.write_text(updated, encoding="utf-8")
+            print(f"Configured defaults in {path}: {SERVER}, key {PUBLIC_KEY}")
+
+
+        if __name__ == "__main__":
+            main()
+
+        APRT_PY
+        git -C libs/hbb_common diff --exit-code --quiet && exit 1
+        git -C libs/hbb_common diff -- src/config.rs
+    - name: Install prerequisites
+      run: |
+        sudo apt-get install ca-certificates -y
+        sudo apt-get update -y
+        sudo apt-get install -y \
+          clang \
+          cmake \
+          curl \
+          gcc \
+          git \
+          g++ \
+          libclang-dev \
+          libgtk-3-dev \
+          llvm-dev \
+          nasm \
+          ninja-build \
+          pkg-config \
+          wget
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+      with:
+        toolchain: ${{ env.RUST_VERSION }}
+        targets: ${{ matrix.job.target }}
+        components: rustfmt
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      with:
+        prefix-key: bridge-${{ matrix.job.os }}
+    - name: Cache Bridge
+      id: cache-bridge
+      uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c
+      with:
+        path: /tmp/flutter_rust_bridge
+        key: bridge-${{ matrix.job.flutter-version }}
+    - name: Install flutter
+      uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+      with:
+        channel: stable
+        flutter-version: ${{ matrix.job.flutter-version }}
+        cache: true
+    - name: Install flutter rust bridge deps
+      shell: bash
+      run: |
+        cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
+        cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
+        if [[ "${{ matrix.job.flutter-version }}" == "3.22.3" ]]; then
+          # Default Flutter 3.22.3: extended_text 14 needs a newer Dart, so downgrade for resolution.
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+        else
+          # Flutter 3.44 bridge for Windows/macOS arm64: match those builds' source/pubspec state so
+          # the generated *.freezed.dart compiles against the same Flutter/freezed they resolve.
+          bash .github/patches/apply_flutter_3.44_source_patches.sh
+        fi
+        pushd flutter && flutter pub get && popd
+    - name: Run flutter rust bridge
+      run: |
+        ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+        cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+    - name: Upload Artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: ${{ matrix.job.artifact-name }}
+        path: |
+          ./src/bridge_generated.rs
+          ./src/bridge_generated.io.rs
+          ./flutter/lib/generated_bridge.dart
+          ./flutter/lib/generated_bridge.freezed.dart
+          ./flutter/macos/Runner/bridge_generated.h
+          ./flutter/ios/Runner/bridge_generated.h
+    env:
+      CARGO_EXPAND_VERSION: 1.0.95
+      FLUTTER_RUST_BRIDGE_VERSION: 1.80.1
+      RUST_VERSION: '1.75'
+    timeout-minutes: 180
+  build-RustDeskTempTopMostWindow:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+    env:
+      project_path: WindowInjection/WindowInjection.vcxproj
+      build_output_dir: RustDeskTempTopMostWindow/WindowInjection/x64/Release
+    steps:
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce
+    - name: Download the source code
+      run: |
+        git clone https://github.com/rustdesk-org/RustDeskTempTopMostWindow RustDeskTempTopMostWindow
+    - name: Build the project
+      run: |
+        cd RustDeskTempTopMostWindow && git checkout ecd8d6a139eee76845ea66423fb739af450fda90
+        msbuild ${{ env.project_path }} -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+    - name: Archive build artifacts
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: topmostwindow-artifacts-x64
+        path: |
+          ./${{ env.build_output_dir }}/WindowInjection.dll
+    timeout-minutes: 180
+  build-for-windows-flutter:
+    name: ${{ matrix.job.target }}
+    needs:
+    - build-RustDeskTempTopMostWindow
+    - generate-bridge
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+        - target: x86_64-pc-windows-msvc
+          os: windows-2022
+          arch: x86_64
+          flutter-arch: x64
+          vcpkg-triplet: x64-windows-static
+          build-args: --vram
+    steps:
+    - name: Export GitHub Actions cache environment variables
+      uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+      with:
+        script: |
+          core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+    - name: Checkout source code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        submodules: recursive
+        repository: rustdesk/rustdesk
+        ref: 95cca3f661f635b3cc85c04935fe8d96d8f432ef
+        persist-credentials: false
+    - name: Embed APRT server defaults
+      shell: bash
+      run: |
+        python3 - <<'APRT_PY'
+        #!/usr/bin/env python3
+        """Set APRT's default server and verification key in a RustDesk source checkout."""
+
+        import argparse
+        import base64
+        from pathlib import Path
+        import re
+
+        SERVER = "rustdesk.aprt.info"
+        PUBLIC_KEY = "Hag3BO1Z4qjSWIstKuNueXedZPL9CKJ4FWbxFC4nfRQ="
+
+
+        def main():
+            parser = argparse.ArgumentParser(description=__doc__)
+            parser.add_argument("source", type=Path, help="RustDesk checkout with initialized submodules")
+            args = parser.parse_args(["."])
+            if len(base64.b64decode(PUBLIC_KEY, validate=True)) != 32:
+                raise SystemExit("Expected a 32-byte server public key")
+            path = args.source / "libs/hbb_common/src/config.rs"
+            if not path.is_file():
+                raise SystemExit(f"Missing {path}; run git submodule update --init --recursive first")
+            original = path.read_text(encoding="utf-8")
+            updated = original
+            replacements = {
+                "RENDEZVOUS_SERVERS": (
+                    r'pub const RENDEZVOUS_SERVERS:\s*&\[&str\]\s*=\s*&\[[\s\S]*?\];',
+                    f'pub const RENDEZVOUS_SERVERS: &[&str] = &["{SERVER}"];',
+                ),
+                "RS_PUB_KEY": (
+                    r'pub const RS_PUB_KEY:\s*&str\s*=\s*"[^"\n]*";',
+                    f'pub const RS_PUB_KEY: &str = "{PUBLIC_KEY}";',
+                ),
+            }
+            for name, (pattern, replacement) in replacements.items():
+                updated, count = re.subn(pattern, lambda _: replacement, updated)
+                if count != 1:
+                    raise SystemExit(f"Expected exactly one {name} declaration; found {count}. No file written.")
+            if updated != original:
+                path.write_text(updated, encoding="utf-8")
+            print(f"Configured defaults in {path}: {SERVER}, key {PUBLIC_KEY}")
+
+
+        if __name__ == "__main__":
+            main()
+
+        APRT_PY
+        git -C libs/hbb_common diff --exit-code --quiet && exit 1
+        git -C libs/hbb_common diff -- src/config.rs
+    - name: Restore bridge files
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: ${{ matrix.job.arch == 'aarch64' && 'bridge-artifact-flutter-3.44' || 'bridge-artifact' }}
+        path: ./
+    - name: Install LLVM and Clang
+      uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
+      with:
+        version: ${{ env.LLVM_VERSION }}
+    - name: Install flutter
+      id: flutter
+      uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225
+      with:
+        channel: stable
+        flutter-version: ${{ matrix.job.arch == 'aarch64' && env.FLUTTER_WINDOWS_ARM_VERSION || env.FLUTTER_VERSION }}
+        architecture: x64
+    - name: Force arm64 Dart SDK + engine
+      if: ${{ matrix.job.arch == 'aarch64' }}
+      run: |
+        $flutterRoot = "${{ steps.flutter.outputs['CACHE-PATH'] }}"
+        Write-Host "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE"
+        Write-Host "Flutter root: $flutterRoot"
+        Remove-Item -Force "$flutterRoot\bin\cache\engine-dart-sdk.stamp" -ErrorAction SilentlyContinue
+        & "$flutterRoot\bin\internal\update_dart_sdk.ps1"
+        # Confirm the Dart we ended up with is arm64 ("on windows_arm64"); fail loudly if not.
+        $dartVer = & "$flutterRoot\bin\dart.bat" --version 2>&1 | Out-String
+        Write-Host $dartVer
+        if ($dartVer -notmatch "windows_arm64") {
+          Write-Error "Expected an arm64 Dart SDK but got: $dartVer"
+          exit 1
+        }
+        & "$flutterRoot\bin\flutter.bat" precache --windows
+        # Fail fast if precache pulled the wrong-arch Windows engine: an arm64 Dart should
+        # fetch windows-arm64 engine artifacts. Bailing here saves the ~25min Rust build.
+        $engineDir = "$flutterRoot\bin\cache\artifacts\engine"
+        Write-Host "Engine artifacts present:"
+        Get-ChildItem $engineDir -Directory | Select-Object -ExpandProperty Name | Write-Host
+        if (-not (Test-Path "$engineDir\windows-arm64-release")) {
+          Write-Error "Expected windows-arm64-release engine artifacts but they are missing (wrong-arch SDK)."
+          exit 1
+        }
+    - name: Replace engine with rustdesk custom flutter engine
+      if: ${{ matrix.job.arch == 'x86_64' }}
+      run: |
+        flutter doctor -v
+        flutter precache --windows
+        Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+        Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+        mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+    - name: Patch flutter
+      if: ${{ matrix.job.arch == 'x86_64' }}
+      shell: bash
+      run: |
+        cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+        cd $(dirname $(dirname $(which flutter)))
+        if [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]]; then
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+        fi
+    - name: Patch RustDesk sources for Flutter 3.44 (arm64)
+      if: ${{ matrix.job.arch == 'aarch64' }}
+      shell: bash
+      run: bash .github/patches/apply_flutter_3.44_source_patches.sh
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+      with:
+        toolchain: ${{ env.SCITER_RUST_VERSION }}
+        targets: ${{ matrix.job.target }}
+        components: rustfmt
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      with:
+        prefix-key: ${{ matrix.job.os }}
+    - name: Setup vcpkg with Github Actions binary cache
+      uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+      with:
+        vcpkgDirectory: C:\vcpkg
+        vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+        doNotCache: false
+    - name: Install vcpkg dependencies
+      env:
+        VCPKG_DEFAULT_HOST_TRIPLET: ${{ matrix.job.vcpkg-triplet }}
+      run: |
+        if ! $VCPKG_ROOT/vcpkg \
+          install \
+          --triplet ${{ matrix.job.vcpkg-triplet }} \
+          --x-install-root="$VCPKG_ROOT/installed"; then
+          find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+            echo "$_1:"
+            echo "======"
+            cat "$_1"
+            echo "======"
+            echo ""
+          done
+          exit 1
+        fi
+        head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
+      shell: bash
+    - name: Set SODIUM_LIB_DIR (arm64)
+      if: ${{ matrix.job.arch == 'aarch64' }}
+      shell: bash
+      run: echo "SODIUM_LIB_DIR=$VCPKG_ROOT/installed/${{ matrix.job.vcpkg-triplet }}/lib" >> "$GITHUB_ENV"
+    - name: Build rustdesk
+      run: |
+        # Windows: build RustDesk
+        # --hwcodec is shared by all Windows targets; per-target extras (e.g. --vram) come from the matrix
+        python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec ${{ matrix.job.build-args }}
+        mv ./flutter/build/windows/${{ matrix.job.flutter-arch }}/runner/Release ./rustdesk
+
+        # Download usbmmidd_v2.zip and extract it to ./rustdesk
+        Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+        Expand-Archive usbmmidd_v2.zip -DestinationPath .
+        Remove-Item -Path usbmmidd_v2\Win32 -Recurse
+        Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
+        mv -Force .\usbmmidd_v2 ./rustdesk
+
+        # Download printer driver files and extract them to ./rustdesk
+        try {
+          Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip -OutFile rustdesk_printer_driver_v4-1.4.zip
+          Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/printer_driver_adapter.zip -OutFile printer_driver_adapter.zip
+          Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/sha256sums -OutFile sha256sums
+
+          # Check and move the files
+          $checksum_driver = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*rustdesk_printer_driver_v4-1.4\.zip$').Matches.Groups[1].Value
+          $downloadsum_driver = Get-FileHash -Path rustdesk_printer_driver_v4-1.4.zip -Algorithm SHA256
+          $checksum_adapter = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*printer_driver_adapter\.zip$').Matches.Groups[1].Value
+          $downloadsum_adapter = Get-FileHash -Path printer_driver_adapter.zip -Algorithm SHA256
+          if ($checksum_driver -eq $downloadsum_driver.Hash -and $checksum_adapter -eq $downloadsum_adapter.Hash) {
+              Write-Output "rustdesk_printer_driver_v4-1.4, checksums match, extract the file."
+              Expand-Archive rustdesk_printer_driver_v4-1.4.zip -DestinationPath .
+              mkdir ./rustdesk/drivers
+              mv -Force .\rustdesk_printer_driver_v4-1.4 ./rustdesk/drivers/RustDeskPrinterDriver
+              Expand-Archive printer_driver_adapter.zip -DestinationPath .
+              mv -Force .\printer_driver_adapter.dll ./rustdesk
+          } elseif ($checksum_driver -ne $downloadsum_driver.Hash) {
+              Write-Output "rustdesk_printer_driver_v4-1.4, checksums do not match, ignore the file."
+          } else {
+              Write-Output "printer_driver_adapter.dll, checksums do not match, ignore the file."
+          }
+        } catch {
+            Write-Host "Ingore the printer driver error."
+        }
+    - name: Run the Rust tests
+      if: ${{ !true && matrix.job.arch == 'x86_64' }}
+      shell: bash
+      run: |
+        # The build's own features, so the tests see the code that ships.
+        FEATURES=$(python3 ./build.py --portable --flutter --skip-portable-pack --hwcodec ${{ matrix.job.build-args }} --print-features)
+        cargo test --locked --release --lib --features "$FEATURES"
+        # Its Windows tests run nowhere else.
+        cargo test --locked --release -p clipboard
+    - name: find Runner.res
+      continue-on-error: true
+      shell: bash
+      run: |
+        runner_res=$(find . -name "Runner.res");
+        if [ "$runner_res" == "" ]; then
+          echo "Runner.res: not found";
+        else
+          echo "Runner.res: $runner_res";
+          cp $runner_res ./libs/portable/Runner.res;
+          echo "list ./libs/portable/Runner.res";
+          ls -l ./libs/portable/Runner.res;
+        fi
+    - name: Download RustDeskTempTopMostWindow artifacts
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: ${{ matrix.job.arch == 'aarch64' && 'topmostwindow-artifacts-ARM64' || 'topmostwindow-artifacts-x64' }}
+        path: ./rustdesk
+    - name: Upload unsigned
+      if: env.UPLOAD_ARTIFACT == 'true'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: rustdesk-unsigned-windows-${{ matrix.job.arch }}
+        path: rustdesk
+    - name: Build self-extracted executable
+      shell: bash
+      run: |
+        sed -i '/dpiAware/d' res/manifest.xml
+        pushd ./libs/portable
+        pip3 install -r requirements.txt
+        python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+        popd
+        mkdir -p ./SignOutput
+        mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.exe
+    - name: Upload APRT Windows executable
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: rustdesk-aprt-windows-x64
+        path: SignOutput/rustdesk-*-x86_64.exe
+        if-no-files-found: error
+    timeout-minutes: 180
+  build-rustdesk-linux:
+    needs:
+    - generate-bridge
+    name: build rustdesk linux ${{ matrix.job.target }}
+    runs-on: ${{ matrix.job.on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+        - arch: x86_64
+          target: x86_64-unknown-linux-gnu
+          distro: ubuntu18.04
+          'on': ubuntu-22.04
+          deb_arch: amd64
+          vcpkg-triplet: x64-linux
+    steps:
+    - name: Export GitHub Actions cache environment variables
+      uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+      with:
+        script: |
+          core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+    - name: Maximize build space
+      run: |
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /usr/share/dotnet
+        sudo apt-get update -y
+        sudo apt-get install -y nasm
+        if [[ "${{ matrix.job.arch }}" == "x86_64" ]]; then
+          sudo apt-get install -y qemu-user-static
+        fi
+    - name: Checkout source code
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        submodules: recursive
+        repository: rustdesk/rustdesk
+        ref: 95cca3f661f635b3cc85c04935fe8d96d8f432ef
+        persist-credentials: false
+    - name: Embed APRT server defaults
+      shell: bash
+      run: |
+        python3 - <<'APRT_PY'
+        #!/usr/bin/env python3
+        """Set APRT's default server and verification key in a RustDesk source checkout."""
+
+        import argparse
+        import base64
+        from pathlib import Path
+        import re
+
+        SERVER = "rustdesk.aprt.info"
+        PUBLIC_KEY = "Hag3BO1Z4qjSWIstKuNueXedZPL9CKJ4FWbxFC4nfRQ="
+
+
+        def main():
+            parser = argparse.ArgumentParser(description=__doc__)
+            parser.add_argument("source", type=Path, help="RustDesk checkout with initialized submodules")
+            args = parser.parse_args(["."])
+            if len(base64.b64decode(PUBLIC_KEY, validate=True)) != 32:
+                raise SystemExit("Expected a 32-byte server public key")
+            path = args.source / "libs/hbb_common/src/config.rs"
+            if not path.is_file():
+                raise SystemExit(f"Missing {path}; run git submodule update --init --recursive first")
+            original = path.read_text(encoding="utf-8")
+            updated = original
+            replacements = {
+                "RENDEZVOUS_SERVERS": (
+                    r'pub const RENDEZVOUS_SERVERS:\s*&\[&str\]\s*=\s*&\[[\s\S]*?\];',
+                    f'pub const RENDEZVOUS_SERVERS: &[&str] = &["{SERVER}"];',
+                ),
+                "RS_PUB_KEY": (
+                    r'pub const RS_PUB_KEY:\s*&str\s*=\s*"[^"\n]*";',
+                    f'pub const RS_PUB_KEY: &str = "{PUBLIC_KEY}";',
+                ),
+            }
+            for name, (pattern, replacement) in replacements.items():
+                updated, count = re.subn(pattern, lambda _: replacement, updated)
+                if count != 1:
+                    raise SystemExit(f"Expected exactly one {name} declaration; found {count}. No file written.")
+            if updated != original:
+                path.write_text(updated, encoding="utf-8")
+            print(f"Configured defaults in {path}: {SERVER}, key {PUBLIC_KEY}")
+
+
+        if __name__ == "__main__":
+            main()
+
+        APRT_PY
+        git -C libs/hbb_common diff --exit-code --quiet && exit 1
+        git -C libs/hbb_common diff -- src/config.rs
+    - name: Set Swap Space
+      uses: pierotofy/set-swap-space@49819abfb41bd9b44fb781159c033dba90353a7c
+      with:
+        swap-size-gb: 12
+    - name: Free Space
+      run: |
+        df -h
+        free -m
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+      if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
+      with:
+        toolchain: ${{ env.RUST_VERSION }}
+        targets: ${{ matrix.job.target }}
+        components: rustfmt
+    - name: Save Rust toolchain version
+      run: |
+        RUST_TOOLCHAIN_VERSION=$(cargo --version | awk '{print $2}')
+        echo "RUST_TOOLCHAIN_VERSION=$RUST_TOOLCHAIN_VERSION" >> $GITHUB_ENV
+    - name: Disable rust bridge build
+      run: |
+        # only build cdylib
+        sed -i  "s/\[\"cdylib\", \"staticlib\", \"rlib\"\]/\[\"cdylib\"\]/g" Cargo.toml
+    - name: Restore bridge files
+      if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: bridge-artifact
+        path: ./
+    - name: Install CMake for vcpkg on Linux ARM64
+      if: matrix.job.arch == 'aarch64' && env.UPLOAD_ARTIFACT == 'true'
+      run: |
+        python3 -m pip install --user "cmake==${VCPKG_CMAKE_VERSION}"
+        user_base="$(python3 -m site --user-base)"
+        "${user_base}/bin/cmake" --version
+        echo "${user_base}/bin" >> "${GITHUB_PATH}"
+    - name: Setup vcpkg with Github Actions binary cache
+      if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
+      uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+      with:
+        vcpkgDirectory: /opt/artifacts/vcpkg
+        vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+        doNotCache: false
+    - name: Install vcpkg dependencies
+      if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
+      run: |
+        sudo apt install -y libva-dev && apt show libva-dev
+        if ! $VCPKG_ROOT/vcpkg \
+          install \
+          --triplet ${{ matrix.job.vcpkg-triplet }} \
+          --x-install-root="$VCPKG_ROOT/installed"; then
+          find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+            echo "$_1:"
+            echo "======"
+            cat "$_1"
+            echo "======"
+            echo ""
+          done
+          exit 1
+        fi
+        head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
+      shell: bash
+    - name: Restore bridge files
+      if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: bridge-artifact
+        path: ./
+    - uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8
+      name: Build rustdesk
+      id: vcpkg
+      if: matrix.job.arch == 'x86_64' || env.UPLOAD_ARTIFACT == 'true'
+      with:
+        arch: ${{ matrix.job.arch }}
+        distro: ${{ matrix.job.distro }}
+        githubToken: ${{ github.token }}
+        setup: |
+          ls -l "${PWD}"
+          ls -l /opt/artifacts/vcpkg/installed
+        dockerRunArgs: |
+          --volume "${PWD}:/workspace"
+          --volume "/opt/artifacts:/opt/artifacts"
+        shell: /bin/bash
+        install: |
+          apt-get update -y
+          echo -e "installing deps"
+          apt-get install -y \
+             build-essential \
+             clang \
+             cmake \
+             curl \
+             gcc \
+             git \
+             g++ \
+             libayatana-appindicator3-dev \
+             libasound2-dev \
+             libclang-10-dev \
+             libgstreamer1.0-dev \
+             libgstreamer-plugins-base1.0-dev \
+             libgtk-3-dev \
+             libpulse-dev \
+             libva-dev \
+             libxcb-randr0-dev \
+             libxcb-shape0-dev \
+             libxcb-xfixes0-dev \
+             libxdo-dev \
+             libxfixes-dev \
+             llvm-10-dev \
+             nasm \
+             ninja-build \
+             pkg-config \
+             tree \
+             python3 \
+             rpm \
+             unzip \
+             wget \
+             xz-utils \
+             libssl-dev
+          # we have libopus compiled by us.
+          apt-get remove -y libopus-dev || true
+          # output devs
+          ls -l ./
+          tree -L 3 /opt/artifacts/vcpkg/installed
+        run: |
+          # disable git safe.directory
+          git config --global --add safe.directory "*"
+          # rust
+          pushd /opt
+          # do not use rustup, because memory overflow in qemu
+          wget -O rust.tar.gz https://static.rust-lang.org/dist/rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ matrix.job.target }}.tar.gz
+          tar -zxvf rust.tar.gz > /dev/null && rm rust.tar.gz
+          cd rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ matrix.job.target }} && ./install.sh
+          rm -rf rust-${{env.RUST_TOOLCHAIN_VERSION}}-${{ matrix.job.target }}
+          # edit config
+          mkdir -p ~/.cargo/
+          echo """
+            [source.crates-io]
+            registry = 'https://github.com/rust-lang/crates.io-index'
+          """ > ~/.cargo/config
+          cat ~/.cargo/config
+          # start build
+          pushd /workspace
+          export VCPKG_ROOT=/opt/artifacts/vcpkg
+          if [[ "${{ matrix.job.arch }}" == "aarch64" ]]; then
+            export JOBS="--jobs 3"
+          else
+            export JOBS=""
+          fi
+          echo $JOBS
+          cargo build --locked --lib $JOBS --features hwcodec,flutter,unix-file-copy-paste --release
+          rm -rf target/release/deps target/release/build
+          rm -rf ~/.cargo
+
+          # Setup Flutter
+          # disable git safe.directory
+          git config --global --add safe.directory "*"
+          pushd /workspace
+          case ${{ matrix.job.arch }} in
+            aarch64)
+              export PATH=/opt/flutter-elinux/bin:$PATH
+              sed -i "s/flutter build linux --release/flutter-elinux build linux --verbose/g" ./build.py
+              sed -i "s/x64\/release/arm64\/release/g" ./build.py
+            ;;
+            x86_64)
+              export PATH=/opt/flutter/bin:$PATH
+            ;;
+          esac
+          popd
+          pushd /opt
+          wget https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
+          tar xf flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
+          case ${{ matrix.job.arch }} in
+            aarch64)
+              # clone repo and reset to flutter ${{ env.FLUTTER_VERSION }}
+              git clone https://github.com/sony/flutter-elinux.git || true
+              pushd flutter-elinux
+                git fetch
+                git reset --hard ${{ env.FLUTTER_VERSION }}
+                bin/flutter-elinux doctor -v
+                bin/flutter-elinux precache --linux
+              popd
+              cp -R flutter/bin/cache/artifacts/engine/linux-x64/shader_lib flutter-elinux/flutter/bin/cache/artifacts/engine/linux-arm64
+              rm -rf flutter
+            ;;
+            x86_64)
+              flutter doctor -v
+            ;;
+          esac
+
+          if [[ "3.24.5" == ${{ env.FLUTTER_VERSION }} ]]; then
+            case ${{ matrix.job.arch }} in
+              aarch64)
+                pushd /opt/flutter-elinux/flutter
+              ;;
+              x86_64)
+                pushd /opt/flutter
+              ;;
+            esac
+            git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+            popd
+          fi
+
+          # build flutter
+          pushd /workspace
+          export CARGO_INCREMENTAL=0
+          export DEB_ARCH=${{ matrix.job.deb_arch }}
+          python3 ./build.py --flutter --skip-cargo
+          for name in rustdesk*??.deb; do
+            mv "$name" "${name%%.deb}-${{ matrix.job.arch }}.deb"
+          done
+
+          # rpm package
+          echo -e "start packaging fedora package"
+          pushd /workspace
+          case ${{ matrix.job.arch }} in
+            aarch64)
+              sed -i "s/linux\/x64/linux\/arm64/g" ./res/rpm-flutter.spec
+              ;;
+          esac
+          HBB=`pwd` rpmbuild ./res/rpm-flutter.spec -bb
+          pushd ~/rpmbuild/RPMS/${{ matrix.job.arch }}
+          for name in rustdesk*??.rpm; do
+              mv "$name" /workspace/"${name%%.rpm}.rpm"
+          done
+
+          # rpm suse package
+          echo -e "start packaging suse package"
+          pushd /workspace
+          case ${{ matrix.job.arch }} in
+            aarch64)
+              sed -i "s/linux\/x64/linux\/arm64/g" ./res/rpm-flutter-suse.spec
+              ;;
+          esac
+          HBB=`pwd` rpmbuild ./res/rpm-flutter-suse.spec -bb
+          pushd ~/rpmbuild/RPMS/${{ matrix.job.arch }}
+          for name in rustdesk*??.rpm; do
+              mv "$name" /workspace/"${name%%.rpm}-suse.rpm"
+          done
+    - name: Upload deb
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      if: env.UPLOAD_ARTIFACT == 'true'
+      with:
+        name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.deb
+        path: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.deb
+    - name: Upload APRT Linux packages
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: rustdesk-aprt-linux-x64
+        path: |-
+          rustdesk-*.deb
+          rustdesk-*.rpm
+        if-no-files-found: error
+    timeout-minutes: 180
